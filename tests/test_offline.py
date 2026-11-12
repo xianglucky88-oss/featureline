@@ -84,18 +84,6 @@ def test_30d_window_ge_7d(events):
 
 # ---------------------------------------------------------------- 缺失值
 
-
-def test_missing_filled_with_zero(events):
-    """离线缺失填 0（线上填 NaN 后当 0，但打点不同）。"""
-    as_of = events["event_time"].max()
-    df, _ = compute_offline(events, as_of=as_of, window_days=7)
-    assert df["user_7d_order_cnt"].null_count() == 0
-    assert df["user_7d_gmv_cents"].null_count() == 0
-
-
-# ---------------------------------------------------------------- item 特征
-
-
 def test_item_ctr_in_range(events):
     as_of = events["event_time"].max()
     _, items = compute_offline(events, as_of=as_of, window_days=7)

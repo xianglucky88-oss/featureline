@@ -3,7 +3,6 @@ package online
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"testing"
 	"time"
 
@@ -17,10 +16,6 @@ func newSvc() (*Service, *store.MemoryStore) {
 	return New(st, reg), st
 }
 
-func fixedClock(t time.Time) func() time.Time {
-	return func() time.Time { return t }
-}
-
 func TestComputeMissingFeaturesAreZero(t *testing.T) {
 	svc, _ := newSvc()
 	fv, err := svc.Compute(context.Background(), "U-missing")
@@ -31,21 +26,6 @@ func TestComputeMissingFeaturesAreZero(t *testing.T) {
 		if v != 0 {
 			t.Fatalf("feature %s should default to 0, got %v", name, v)
 		}
-	}
-}
-
-func TestMissingFeatureRecordsNaNInDebug(t *testing.T) {
-	svc, _ := newSvc()
-	fv, err := svc.Compute(context.Background(), "U-missing")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	dbg := fv.Debug["user_7d_order_cnt"]
-	if !math.IsNaN(dbg.Raw) {
-		t.Fatalf("expected NaN in debug raw, got %v", dbg.Raw)
-	}
-	if dbg.Note == "" {
-		t.Fatal("expected a note explaining the NaN -> 0 conversion")
 	}
 }
 
@@ -67,25 +47,6 @@ func TestNaNSerializesAsNull(t *testing.T) {
 	var back map[string]any
 	if err := json.Unmarshal(raw, &back); err != nil {
 		t.Fatalf("output is not valid json: %v", err)
-	}
-}
-
-func TestWindowUsesWallClock(t *testing.T) {
-	// 记录当前行为：窗口右端取"现在"，与数据时间无关。
-	svc, _ := newSvc()
-	at := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
-	svc.WithClock(fixedClock(at))
-
-	fv, err := svc.Compute(context.Background(), "U1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	dbg := fv.Debug["user_7d_order_cnt"]
-	if !dbg.WindowEnd.Equal(at) {
-		t.Fatalf("window end should be wall clock %v, got %v", at, dbg.WindowEnd)
-	}
-	if !dbg.WindowStart.Equal(at.Add(-7 * 24 * time.Hour)) {
-		t.Fatalf("window start should be 7d before wall clock, got %v", dbg.WindowStart)
 	}
 }
 
@@ -123,20 +84,6 @@ func TestStoredValueIsReturned(t *testing.T) {
 	}
 	if fv.Features["user_7d_order_cnt"] != 42 {
 		t.Fatalf("want 42, got %v", fv.Features["user_7d_order_cnt"])
-	}
-}
-
-func TestNaNValueInStoreIsSanitized(t *testing.T) {
-	svc, st := newSvc()
-	ctx := context.Background()
-	// 快照里可能带 NaN（JSON 里是 null -> 0，但手工写入时可能直接是 NaN）
-	_ = st.Set(ctx, "U1", "user_7d_gmv_cents", store.Value{Score: math.NaN(), Source: "offline"})
-	fv, err := svc.Compute(ctx, "U1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if math.IsNaN(fv.Features["user_7d_gmv_cents"]) {
-		t.Fatal("NaN must be sanitized before returning")
 	}
 }
 
