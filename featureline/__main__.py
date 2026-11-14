@@ -3,13 +3,14 @@
     python -m featureline build       生成事件 + 算离线特征 + 导出快照
     python -m featureline export      只导出快照
     python -m featureline parity      对比离线/线上
-    python -m featureline backfill    演示 30 天回填耗时
+    python -m featureline backfill    时间点正确的增量回填（见 featureline/backfill.py）
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,6 @@ from pathlib import Path
 import polars as pl
 
 from .offline import (
-    backfill_plan,
     compute_offline,
     export_snapshot,
     generate_events,
@@ -98,39 +98,115 @@ def cmd_parity(args) -> int:
     return parity_main(argv)
 
 
-def cmd_backfill(args) -> int:
-    """演示回填成本。
+def _make_labels(events: pl.DataFrame, days: int, seed: int) -> pl.DataFrame:
+    """构造待回填的样本：最近 days 天，每天每个用户一条，label_time=当天 23:47。
 
-    当前实现：每天都要全量重算 30 天窗口。
-    这里用真实计时，而不是估算。
+    label_time 故意不取整日，用来验证边界日精修（窗口右端落在一天中间）。
     """
-    DATA.mkdir(parents=True, exist_ok=True)
-    events = generate_events(n_users=args.users, n_events=args.events, seed=args.seed)
-    days = backfill_plan(args.days)
+    import random
+
+    rnd = random.Random(seed)
     max_ts = events["event_time"].max()
+    users = sorted(events["user_id"].unique().to_list())
+    items = sorted(events["item_id"].unique().to_list())
+    rows = []
+    for i in range(days):
+        day = (max_ts - timedelta(days=i)).date()
+        lt = datetime(day.year, day.month, day.day, 23, 47, tzinfo=timezone.utc)
+        for u in users:
+            rows.append(
+                {
+                    "label_id": f"{day}:{u}",
+                    "user_id": u,
+                    "item_id": rnd.choice(items),
+                    "label_time": lt,
+                }
+            )
+    return pl.DataFrame(rows).with_columns(
+        pl.col("label_time").cast(pl.Datetime("us", "UTC"))
+    )
+
+
+def cmd_backfill(args) -> int:
+    """时间点正确的增量回填。
+
+    流程：ingest（幂等分区）→ build_state（增量 tiles）→ backfill_labels
+    （按标签日分区输出）。随后做两件验证：
+
+      1. 立刻重跑一次 —— 所有分区应报 unchanged（幂等）；
+      2. 抽样与"每样本扫全量"的暴力参考实现逐值对比（正确性）。
+    """
+    from .backfill import (
+        _compute,
+        backfill_labels,
+        brute_force_features,
+        build_state,
+        ingest_events,
+    )
+
+    lake = DATA / "lake"
+    if lake.exists() and not args.keep:
+        shutil.rmtree(lake)
+    lake.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
-    per_day = []
-    for i, label in enumerate(days):
-        as_of = max_ts - timedelta(days=len(days) - 1 - i)
-        start = time.perf_counter()
-        compute_offline(events, as_of=as_of, window_days=30)
-        per_day.append(round(time.perf_counter() - start, 4))
-    total = time.perf_counter() - t0
+    events = generate_events(n_users=args.users, n_events=args.events, seed=args.seed)
+    ing = ingest_events(events, lake)
+    st = build_state(lake)
+    t_state = time.perf_counter() - t0
+
+    labels = _make_labels(events, args.days, seed=args.seed)
+    labels.write_parquet(lake / "labels.parquet")
+
+    t1 = time.perf_counter()
+    summary = backfill_labels(labels, lake)
+    t_backfill = time.perf_counter() - t1
+
+    # 幂等性：重跑应全部 unchanged
+    rerun = backfill_labels(labels, lake)
+    idempotent = all(s["status"] == "unchanged" for s in rerun.values())
+
+    # 正确性自检：抽样 vs 暴力全量扫描
+    sample = labels.sample(min(300, labels.height), seed=1)
+    fast = _compute(sample, lake).sort("label_id")
+    ref = brute_force_features(events, sample).sort("label_id")
+    mismatched = 0
+    max_diff = 0.0
+    for c in ("user_7d_order_cnt", "user_7d_gmv_cents", "user_30d_order_cnt",
+              "user_category_affinity", "item_7d_ctr", "item_7d_exposure"):
+        diff = (fast[c] - ref[c]).abs().max()
+        max_diff = max(max_diff, float(diff) if diff is not None else 0.0)
+        mismatched += int((fast[c] != ref[c]).sum())
 
     print(
         json.dumps(
             {
-                "days": len(days),
-                "total_seconds": round(total, 3),
-                "avg_seconds_per_day": round(sum(per_day) / len(per_day), 4),
-                "note": "当前实现逐日全量重算；生产数据量下实测约 6 小时",
+                "design": "point-in-time backfill: 每日预聚合 tiles + 边界日原始事件精修",
+                "ingest": ing,
+                "state": {
+                    "rebuilt_partitions": len(st["rebuilt"]),
+                    "watermark": st["watermark"],
+                },
+                "labels": labels.height,
+                "label_dates": len(summary),
+                "seconds": {
+                    "ingest_and_state": round(t_state, 3),
+                    "backfill": round(t_backfill, 3),
+                    "per_label_date": round(t_backfill / max(len(summary), 1), 4),
+                },
+                "idempotent_rerun": idempotent,
+                "verification": {
+                    "sampled_labels": sample.height,
+                    "mismatched_values": mismatched,
+                    "max_abs_diff": max_diff,
+                },
+                "manifest": str(lake / "backfill" / "_manifest.json"),
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    return 0
+    return 0 if idempotent and mismatched == 0 else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -161,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--users", type=int, default=200)
     f.add_argument("--events", type=int, default=20000)
     f.add_argument("--seed", type=int, default=20261112)
+    f.add_argument("--keep", action="store_true", help="复用已有 lake（不清空重建）")
     f.set_defaults(func=cmd_backfill)
 
     args = ap.parse_args(argv)

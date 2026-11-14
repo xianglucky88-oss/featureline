@@ -222,11 +222,3 @@ def export_snapshot(features: pl.DataFrame, item_agg: pl.DataFrame, path: Path) 
 
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"keys": len(data), "as_of": ts}
-
-
-def backfill_plan(days: int = 30) -> list[str]:
-    """回填计划（当前实现：逐日全量重算）。
-
-    30 天要重算 30 次全量窗口，实测 6 小时。
-    """
-    return [f"day-{i:02d}" for i in range(days)]
