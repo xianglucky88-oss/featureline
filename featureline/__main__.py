@@ -1,9 +1,12 @@
 """命令行入口。
 
-    python -m featureline build       生成事件 + 算离线特征 + 导出快照
+    python -m featureline build       生成事件 + 算离线特征 + 导出版本化快照
     python -m featureline export      只导出快照
     python -m featureline parity      对比离线/线上
     python -m featureline backfill    演示 30 天回填耗时
+
+build/export 默认从 data/registry 读取注册表、固定 data/binding.json 绑定，
+快照头部携带同一份清单；--no-binding 时退回旧的无版本坐标格式（仅历史对照）。
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 import polars as pl
@@ -20,12 +23,37 @@ import polars as pl
 from .offline import (
     backfill_plan,
     compute_offline,
+    compute_offline_bound,
     export_snapshot,
     generate_events,
     write_offline,
 )
+from .bootstrap import bootstrap_registry
+from .registry_client import Binding, RegistryClient
 
 DATA = Path("data")
+DEFAULT_REGISTRY = DATA / "registry"
+DEFAULT_BINDING = DATA / "binding.json"
+
+
+def _load_binding(registry_dir: Path, binding_path: Path):
+    """返回 (client, binding)；注册表缺失时自动播种后再加载。"""
+    if not registry_dir.exists() or not binding_path.exists():
+        bootstrap_registry(registry_dir, binding_path)
+    client = RegistryClient.open(registry_dir)
+    return client, Binding.read(binding_path)
+
+
+def cmd_init_registry(args) -> int:
+    binding = bootstrap_registry(Path(args.registry), Path(args.binding))
+    print(json.dumps({
+        "registry": args.registry,
+        "binding": args.binding,
+        "manifest_id": binding.manifest_id,
+        "fingerprint": binding.fingerprint,
+        "features": len(binding.entries),
+    }, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_build(args) -> int:
@@ -37,20 +65,33 @@ def cmd_build(args) -> int:
     events.write_parquet(DATA / "events.parquet")
     print(f"events: {events.height} rows -> data/events.parquet")
 
-    features, item_agg = compute_offline(
-        events,
-        as_of=None,
-        window_days=7,
-        inclusive_right=True,
+    client, binding = (None, None) if args.no_binding else _load_binding(
+        Path(args.registry), Path(args.binding)
     )
+
+    if binding is not None:
+        # 版本化路径：窗口与默认值全部来自绑定的已发布定义。
+        features, item_agg = compute_offline_bound(events, binding, client)
+        print(f"bound to {binding.manifest_id} ({len(binding.entries)} definitions)")
+    else:
+        features, item_agg = compute_offline(
+            events, as_of=None, window_days=7, inclusive_right=False
+        )
+
     write_offline(features, DATA / "offline_features.parquet")
     if item_agg is not None:
         item_agg.write_parquet(DATA / "item_features.parquet")
 
-    snap = export_snapshot(features, item_agg if item_agg is not None else pl.DataFrame(), DATA / "redis_snapshot.json")
+    snap = export_snapshot(
+        features,
+        item_agg if item_agg is not None else pl.DataFrame(),
+        DATA / "redis_snapshot.json",
+        binding=binding,
+        client=client,
+    )
 
     # 30 天特征
-    f30, _ = compute_offline(events, as_of=None, window_days=30, inclusive_right=True)
+    f30, _ = compute_offline(events, as_of=None, window_days=30, inclusive_right=False)
     f30.select(["user_id", "user_30d_order_cnt"]).write_parquet(DATA / "offline_features_30d.parquet")
 
     elapsed = time.perf_counter() - t0
@@ -78,7 +119,13 @@ def cmd_export(args) -> int:
     features = pl.read_parquet(p)
     item_path = DATA / "item_features.parquet"
     item_agg = pl.read_parquet(item_path) if item_path.exists() else pl.DataFrame()
-    snap = export_snapshot(features, item_agg, DATA / "redis_snapshot.json")
+    client, binding = (None, None) if args.no_binding else _load_binding(
+        Path(args.registry), Path(args.binding)
+    )
+    snap = export_snapshot(
+        features, item_agg, DATA / "redis_snapshot.json",
+        binding=binding, client=client,
+    )
     print(json.dumps(snap, ensure_ascii=False, indent=2))
     return 0
 
@@ -142,10 +189,22 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--items", type=int, default=60)
     b.add_argument("--events", type=int, default=20000)
     b.add_argument("--seed", type=int, default=20261112)
+    b.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    b.add_argument("--binding", default=str(DEFAULT_BINDING))
+    b.add_argument("--no-binding", action="store_true",
+                   help="退回无版本坐标的旧快照格式（仅历史对照）")
     b.set_defaults(func=cmd_build)
 
     e = sub.add_parser("export")
+    e.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    e.add_argument("--binding", default=str(DEFAULT_BINDING))
+    e.add_argument("--no-binding", action="store_true")
     e.set_defaults(func=cmd_export)
+
+    i = sub.add_parser("init-registry", help="播种初始定义并生成绑定清单")
+    i.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    i.add_argument("--binding", default=str(DEFAULT_BINDING))
+    i.set_defaults(func=cmd_init_registry)
 
     p = sub.add_parser("parity")
     p.add_argument("--base", default="http://localhost:9500")

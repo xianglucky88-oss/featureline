@@ -1,0 +1,22 @@
+{
+  "name": "user_7d_order_cnt",
+  "entity": "user",
+  "value_type": "float64",
+  "kind": "count",
+  "window": {
+    "size_seconds": 604800,
+    "convention": "[start,end)"
+  },
+  "time_semantics": {
+    "time_column": "event_time",
+    "time_right_bound": "event_time",
+    "time_zone": "UTC"
+  },
+  "default": {
+    "type": "float64",
+    "value": "0"
+  },
+  "description": "用户近 7 天订单数",
+  "owner": "platform",
+  "tags": []
+}

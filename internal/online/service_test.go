@@ -6,18 +6,34 @@ import (
 	"testing"
 	"time"
 
-	"github.com/internal-platform/featureline/internal/feature"
+	"github.com/internal-platform/featureline/internal/registry"
 	"github.com/internal-platform/featureline/internal/store"
 )
 
-func newSvc() (*Service, *store.MemoryStore) {
+func newSvc(t *testing.T) (*Service, *store.MemoryStore, *registry.Registry, registry.Binding) {
+	t.Helper()
+	reg, err := registry.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	if err := reg.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+	b, err := reg.BindActive(nil)
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
 	st := store.NewMemory("")
-	reg := feature.DefaultRegistry()
-	return New(st, reg), st
+	svc, err := New(st, reg, b)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	return svc, st, reg, b
 }
 
-func TestComputeMissingFeaturesAreZero(t *testing.T) {
-	svc, _ := newSvc()
+func TestComputeMissingFeaturesUsePinnedDefault(t *testing.T) {
+	svc, _, _, _ := newSvc(t)
 	fv, err := svc.Compute(context.Background(), "U-missing")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -27,12 +43,21 @@ func TestComputeMissingFeaturesAreZero(t *testing.T) {
 			t.Fatalf("feature %s should default to 0, got %v", name, v)
 		}
 	}
+	// 每个返回值都必须带 FQVN 坐标。
+	for name, fqvn := range fv.Versions {
+		if _, _, _, ok := registry.ParseFQVN(fqvn); !ok {
+			t.Fatalf("feature %s returned bad fqvn %q", name, fqvn)
+		}
+	}
+	if fv.BindingFingerprint == "" || fv.ManifestID == "" {
+		t.Fatal("response must carry binding coordinates")
+	}
 }
 
 // TestNaNSerializesAsNull 记录一个真实踩过的坑：
 // encoding/json 不支持 NaN，直接 Encode 会写出 0 字节。
 func TestNaNSerializesAsNull(t *testing.T) {
-	svc, _ := newSvc()
+	svc, _, _, _ := newSvc(t)
 	fv, err := svc.Compute(context.Background(), "U-missing")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -50,8 +75,8 @@ func TestNaNSerializesAsNull(t *testing.T) {
 	}
 }
 
-func TestWindowForFeature(t *testing.T) {
-	svc, _ := newSvc()
+func TestWindowForFeatureUsesPinnedDefinition(t *testing.T) {
+	svc, _, _, _ := newSvc(t)
 	at := time.Date(2026, 10, 15, 23, 47, 0, 0, time.UTC)
 	start, end, err := svc.WindowFor("user_7d_order_cnt", at)
 	if err != nil {
@@ -65,41 +90,50 @@ func TestWindowForFeature(t *testing.T) {
 	}
 }
 
-func TestWindowForUnknownFeature(t *testing.T) {
-	svc, _ := newSvc()
+func TestWindowForUnboundFeature(t *testing.T) {
+	svc, _, _, _ := newSvc(t)
 	if _, _, err := svc.WindowFor("nope", time.Now()); err == nil {
-		t.Fatal("expected error for unknown feature")
+		t.Fatal("expected error for feature not in binding")
 	}
 }
 
-func TestStoredValueIsReturned(t *testing.T) {
-	svc, st := newSvc()
+func TestStoredValueIsReturnedByFQVN(t *testing.T) {
+	svc, st, _, b := newSvc(t)
 	ctx := context.Background()
-	if err := st.Set(ctx, "U1", "user_7d_order_cnt", store.Value{Score: 42, Source: "offline"}); err != nil {
+	fqvn := b.Entries[0].FQVN
+	if err := st.Set(ctx, "U1", fqvn, store.Value{Score: 42, Source: "offline"}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	fv, err := svc.Compute(ctx, "U1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if fv.Features["user_7d_order_cnt"] != 42 {
-		t.Fatalf("want 42, got %v", fv.Features["user_7d_order_cnt"])
+	name := b.Entries[0].Name
+	if fv.Features[name] != 42 {
+		t.Fatalf("want 42, got %v", fv.Features[name])
+	}
+	if fv.Versions[name] != fqvn {
+		t.Fatalf("version coordinate wrong: %v", fv.Versions[name])
 	}
 }
 
-func TestRegistryHasSixFeatures(t *testing.T) {
-	reg := feature.DefaultRegistry()
-	if len(reg.Names()) != 6 {
-		t.Fatalf("want 6 features, got %d", len(reg.Names()))
+func TestServiceRejectsStaleBinding(t *testing.T) {
+	_, st, reg, _ := newSvc(t)
+	bogus := registry.Binding{
+		ManifestID: "bm-bogus",
+		Entries: []registry.BindingEntry{{
+			Name: "ghost", FQVN: "ghost@9.9", Fingerprint: "00",
+		}},
+	}
+	bogus.Fingerprint = registry.BindingFingerprint(bogus.ManifestID, bogus.Entries)
+	if _, err := New(st, reg, bogus); err == nil {
+		t.Fatal("service must refuse to start with an unresolvable binding")
 	}
 }
 
-func TestRegistryNamesSorted(t *testing.T) {
-	reg := feature.DefaultRegistry()
-	names := reg.Names()
-	for i := 1; i < len(names); i++ {
-		if names[i] < names[i-1] {
-			t.Fatalf("names not sorted: %v", names)
-		}
+func TestBindingHasSixFeatures(t *testing.T) {
+	_, _, _, b := newSvc(t)
+	if len(b.Entries) != 6 {
+		t.Fatalf("want 6 bound features, got %d", len(b.Entries))
 	}
 }

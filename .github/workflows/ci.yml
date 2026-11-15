@@ -44,12 +44,16 @@ jobs:
       - run: |
           python -m pip install -U pip
           pip install -r requirements.txt
-      - name: build offline
+      - name: build offline (pinned to registry binding)
         run: python -m featureline build
       - name: start service
         run: |
-          go build -o /tmp/featureline ./cmd/serve
-          /tmp/featureline -addr 127.0.0.1:9500 -snapshot data/redis_snapshot.json &
+          CGO_ENABLED=0 go build -o /tmp/featureline ./cmd/serve
+          /tmp/featureline -addr 127.0.0.1:9500 \
+            -snapshot data/redis_snapshot.json \
+            -registry data/registry -binding data/binding.json &
           for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:9500/healthz && break; sleep 1; done
-      - name: verify (expected to fail until drift is fixed)
-        run: python scripts/verify_features.py --base http://127.0.0.1:9500 || true
+      - name: verify parity and definition binding
+        run: python scripts/verify_features.py --base http://127.0.0.1:9500
+      - name: registry lifecycle demo
+        run: python scripts/registry_demo.py --base http://127.0.0.1:9500

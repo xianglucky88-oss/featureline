@@ -1,26 +1,20 @@
 """parity check：离线与线上特征的一致性对比。
 
-这是本仓库最重要的工具：它把"训练-服务漂移"量化成一个百分比。
+这是本仓库最重要的工具：它把"训练-服务漂移"量化成一个百分比，并额外校验
+两侧固定的是不是同一份已发布定义（manifest id / 绑定指纹 / 每个 FQVN）。
 
 对比口径的设计（这是关键）：
 
-    线上侧：服务读 Redis 快照，窗口右端 = **请求时刻**（time.Now）
-    离线侧：按**训练样本的标签时间**重算窗口
+    线上侧：服务按绑定清单读版本化键，窗口右端 = 请求时刻（time.Now）
+    离线侧：按**训练样本的标签时间**重算窗口，窗口约定同为左闭右开 [T-7d, T)
 
-这两者的右端天然不同——线上的 as_of 是"今天"，离线的 as_of 是"样本那天"。
-如果训练数据是 3 周前产出的，而线上服务今天还在用同一份快照，
-那么任何随时间变化的特征都会漂移。
-
-要复现这个问题，`--replay-as-of` 模拟"离线在历史时点算特征、线上在当下读取"：
+要复现"离线在历史时点算特征、线上在当下读取"的时间漂移：
 
     python -m featureline parity --base http://localhost:9500 \
         --replay-as-of 2026-10-15T23:47:00Z
 
-此时离线的窗口右端是 10-15，线上的窗口右端是今天（11-12），
-两者相差近一个月，窗口内容完全不同。
-
-`--aligned` 表示两边用同一个 as_of（理论上应该 0% 差异），
-用于验证修复后窗口语义是否真的统一了。
+`--aligned` 表示两边用同一个 as_of（定义已经统一，此时应 0% 差异）。
+`--closed-right` 仅用于复现旧版左闭右闭口径的历史偏差。
 """
 
 from __future__ import annotations
@@ -35,13 +29,9 @@ from typing import Any
 
 import polars as pl
 
-NUMERIC_FEATURES = [
-    "user_7d_order_cnt",
-    "user_7d_gmv_cents",
-    "user_30d_order_cnt",
-    "user_category_affinity",
-]
-ITEM_FEATURES = ["item_7d_ctr", "item_7d_exposure"]
+from .offline import ITEM_FEATURES, USER_FEATURES
+
+NUMERIC_FEATURES = list(USER_FEATURES)
 
 
 @dataclass
@@ -97,6 +87,35 @@ def _as_of_of(online: dict[str, Any]) -> datetime | None:
     return _parse_ts(online.get("as_of"))
 
 
+def _binding_coherence(base: str, user_ids: list[str]) -> dict[str, Any]:
+    """核对在线实例是否把每次读取固定在同一份已发布定义上。"""
+    fingerprints: set[str] = set()
+    manifest_ids: set[str] = set()
+    problems: list[str] = []
+    for uid in user_ids:
+        online = fetch_online(base, uid)
+        if online is None:
+            problems.append(f"{uid}: unreachable")
+            continue
+        fp = online.get("binding_fingerprint")
+        mid = online.get("manifest_id")
+        if not fp or not mid:
+            problems.append(f"{uid}: response missing binding coordinates")
+            continue
+        fingerprints.add(fp)
+        manifest_ids.add(mid)
+        versions = online.get("versions", {})
+        for name, fqvn in versions.items():
+            if "@" not in fqvn:
+                problems.append(f"{uid}/{name}: value without FQVN ({fqvn!r})")
+    return {
+        "ok": not problems and len(fingerprints) <= 1,
+        "manifest_ids": sorted(manifest_ids),
+        "fingerprints": sorted(fingerprints),
+        "problems": problems,
+    }
+
+
 def compare(
     events: pl.DataFrame,
     base: str = "http://localhost:9500",
@@ -104,13 +123,13 @@ def compare(
     sample: int = 50,
     replay_as_of: datetime | None = None,
     aligned: bool = False,
-    inclusive_right: bool = True,
+    inclusive_right: bool = False,
 ) -> dict[str, Any]:
     """逐实体对比。
 
     replay_as_of: 离线侧的窗口右端。None 表示用数据的最大时间。
     aligned:      若为 True，离线也按线上返回的 as_of 计算（用于验证修复）。
-    inclusive_right: 离线窗口是否左闭右闭。
+    inclusive_right: 离线窗口是否左闭右闭（默认 False，与注册表约定一致）。
     """
     from .offline import compute_offline
 
@@ -221,12 +240,18 @@ def compare(
     for d in rows:
         by_feature[d.feature] = by_feature.get(d.feature, 0) + 1
 
+    # ---------- 定义版本一致性 ----------
+    # 在线响应必须带绑定坐标；同一服务所有实体的绑定指纹必须一致，
+    # 且每个特征值都带 FQVN。任何缺失都说明交付链路没有固定到已发布定义。
+    binding_report = _binding_coherence(base, users[: min(5, len(users))])
+
     return {
         "checked": checked,
         "mismatched": len(rows),
         "percent": round(percent * 100, 2),
         "by_feature": by_feature,
         "offline_as_of": as_of_used.isoformat() if as_of_used else None,
+        "binding_coherence": binding_report,
         "stale_snapshot": {
             "count": len(stale),
             "samples": stale[:5],
@@ -255,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sample", type=int, default=50)
     ap.add_argument("--replay-as-of", default=None, help="离线侧窗口右端（ISO 8601）")
     ap.add_argument("--aligned", action="store_true", help="两边用同一个 as_of")
-    ap.add_argument("--closed-right", action="store_true", help="离线用左闭右闭")
+    ap.add_argument("--closed-right", action="store_true",
+                    help="离线用左闭右闭（仅复现旧口径，默认左闭右开）")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
@@ -290,6 +316,12 @@ def main(argv: list[str] | None = None) -> int:
             print("  按特征分布：")
             for f, n in sorted(result["by_feature"].items(), key=lambda x: -x[1]):
                 print(f"    {f:26} {n}")
+        coherence = result.get("binding_coherence") or {}
+        if coherence:
+            mark = "PASS" if coherence.get("ok") else "FAIL"
+            print(f"  [{mark}] 定义版本一致性：manifest={coherence.get('manifest_ids')}")
+            for p in coherence.get("problems", []):
+                print(f"    - {p}")
         stale = result.get("stale_snapshot") or {}
         if stale.get("count"):
             print(f"  ⚠ 快照过期：{stale['count']} 个实体的窗口内无事件，却返回了非零特征值")
