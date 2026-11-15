@@ -40,6 +40,9 @@ print('返回的特征   :', d['features'])
 say "4. 四项一致性断言"
 python3 scripts/verify_features.py --base "$BASE" || true
 
+say "4.5 发布前一致性门禁（三方比对 + 原因分类）"
+python3 -m featureline gate --base "$BASE" || true
+
 say "5. 回填成本"
 python3 -m featureline backfill --days 30
 

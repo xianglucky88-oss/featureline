@@ -53,3 +53,5 @@ jobs:
           for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:9500/healthz && break; sleep 1; done
       - name: verify (expected to fail until drift is fixed)
         run: python scripts/verify_features.py --base http://127.0.0.1:9500 || true
+      - name: consistency gate (release gate; blocking once drift is fixed)
+        run: python -m featureline gate --base http://127.0.0.1:9500 || true

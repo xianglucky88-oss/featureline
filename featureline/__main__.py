@@ -3,6 +3,7 @@
     python -m featureline build       生成事件 + 算离线特征 + 导出快照
     python -m featureline export      只导出快照
     python -m featureline parity      对比离线/线上
+    python -m featureline gate        发布前一致性门禁（阻断式）
     python -m featureline backfill    演示 30 天回填耗时
 """
 
@@ -98,6 +99,28 @@ def cmd_parity(args) -> int:
     return parity_main(argv)
 
 
+def cmd_gate(args) -> int:
+    from .gate import main as gate_main
+
+    argv = [
+        "--base", args.base,
+        "--events", args.events,
+        "--offline", args.offline,
+        "--snapshot", args.snapshot,
+        "--seed", str(args.seed),
+        "--max-entities", str(args.max_entities),
+    ]
+    if args.as_of:
+        argv += ["--as-of", args.as_of]
+    if args.closed_right:
+        argv.append("--closed-right")
+    if args.tolerance is not None:
+        argv += ["--tolerance", str(args.tolerance)]
+    if args.json:
+        argv.append("--json")
+    return gate_main(argv)
+
+
 def cmd_backfill(args) -> int:
     """演示回填成本。
 
@@ -155,6 +178,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--closed-right", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_parity)
+
+    g = sub.add_parser("gate", help="发布前一致性门禁（0 放行 / 1 漂移 / 2 无法结论）")
+    g.add_argument("--base", default="http://localhost:9500")
+    g.add_argument("--events", default="data/events.parquet")
+    g.add_argument("--offline", default="data/offline_features.parquet")
+    g.add_argument("--snapshot", default="data/redis_snapshot.json")
+    g.add_argument("--as-of", dest="as_of", default=None)
+    g.add_argument("--closed-right", action="store_true")
+    g.add_argument("--seed", type=int, default=20261115)
+    g.add_argument("--max-entities", type=int, default=500)
+    g.add_argument("--tolerance", type=float, default=None)
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(func=cmd_gate)
 
     f = sub.add_parser("backfill")
     f.add_argument("--days", type=int, default=30)

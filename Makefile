@@ -7,6 +7,7 @@ help:
 	@echo "make build    离线构建（事件 + 特征 + 快照）"
 	@echo "make serve    起 Go 服务"
 	@echo "make parity   训练/服务一致性对比"
+	@echo "make gate     发布前一致性门禁（0 放行 / 1 漂移 / 2 无法结论）"
 	@echo "make verify   四项一致性断言"
 	@echo "make demo     固定演示序列"
 	@echo "make test     Go + Python 单测"
@@ -23,6 +24,10 @@ serve:
 .PHONY: parity
 parity:
 	$(PY) -m featureline parity --base $(BASE)
+
+.PHONY: gate
+gate:
+	$(PY) -m featureline gate --base $(BASE)
 
 .PHONY: verify
 verify:
