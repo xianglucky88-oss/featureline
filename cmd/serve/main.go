@@ -20,14 +20,34 @@ import (
 
 func main() {
 	var (
-		addr     = flag.String("addr", ":9500", "listen address")
-		snapshot = flag.String("snapshot", "data/redis_snapshot.json", "feature snapshot path")
+		addr       = flag.String("addr", ":9500", "listen address")
+		dir        = flag.String("store-dir", "data/store", "durable store directory (wal + snapshots)")
+		snapshot   = flag.String("snapshot", "data/redis_snapshot.json", "legacy snapshot to import when the store is empty")
+		replace    = flag.Bool("snapshot-replace", false, "import the snapshot as the authoritative baseline even if the store is not empty")
+		compactMiB = flag.Int64("compact-mib", 8, "compact the WAL into a new baseline after this many MiB")
 	)
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
-	st := store.NewMemory(*snapshot)
+	// 存储介质只在这里出现一次：服务其余部分只依赖 store.Store。
+	opts := []store.Option{store.WithCompactionThreshold(*compactMiB << 20)}
+	if *replace {
+		opts = append(opts, store.WithSnapshotReplace(*snapshot))
+	} else {
+		opts = append(opts, store.WithSeedSnapshot(*snapshot))
+	}
+	st, err := store.Open(*dir, opts...)
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			log.Printf("close store: %v", err)
+		}
+	}()
+	log.Printf("store: dir=%s stats=%+v", *dir, st.Stats())
+
 	reg := feature.DefaultRegistry()
 	svc := online.New(st, reg)
 
@@ -80,7 +100,7 @@ func main() {
 		if body.Source == "" {
 			body.Source = "online"
 		}
-		err := st.Set(r.Context(), body.UserID, body.Name, store.Value{
+		err = st.Set(r.Context(), body.UserID, body.Name, store.Value{
 			Score: body.Score, UpdatedAt: time.Now().UTC(), Source: body.Source,
 		})
 		if err != nil {
@@ -88,6 +108,57 @@ func main() {
 			return
 		}
 		writeJSON(w, 200, map[string]bool{"ok": true})
+	})
+
+	// 批量写入：整批一条日志记录、一次 fsync，读者只会看到整批前后。
+	// 通过 store.BatchWriter 使用，不感知介质实现。
+	mux.HandleFunc("/v1/admin/batch", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]string{"error": "POST only"})
+			return
+		}
+		bw, ok := any(st).(store.BatchWriter)
+		if !ok {
+			writeJSON(w, 501, map[string]string{"error": "store does not support batch writes"})
+			return
+		}
+		var body struct {
+			Entries []struct {
+				UserID string  `json:"user_id"`
+				Name   string  `json:"name"`
+				Score  float64 `json:"score"`
+				Source string  `json:"source"`
+			} `json:"entries"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		now := time.Now().UTC()
+		entries := make([]store.Entry, 0, len(body.Entries))
+		for _, e := range body.Entries {
+			if e.UserID == "" {
+				writeJSON(w, 400, map[string]string{"error": "user_id required"})
+				return
+			}
+			if _, ok := reg.Specs[e.Name]; !ok {
+				writeJSON(w, 400, map[string]string{"error": "unknown feature " + e.Name})
+				return
+			}
+			src := e.Source
+			if src == "" {
+				src = "offline"
+			}
+			entries = append(entries, store.Entry{
+				UserID: e.UserID, Name: e.Name,
+				Value: store.Value{Score: e.Score, UpdatedAt: now, Source: src},
+			})
+		}
+		if err := bw.SetBatch(r.Context(), entries); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]int{"written": len(entries)})
 	})
 
 	// 窗口查询：给 parity 脚本用，返回线上侧认定的窗口区间

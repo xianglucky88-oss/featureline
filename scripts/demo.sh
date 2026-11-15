@@ -18,7 +18,9 @@ python3 -m featureline build
 say "2. 起服务"
 mkdir -p bin
 go build -o bin/featureline ./cmd/serve
-./bin/featureline -addr 127.0.0.1:9500 -snapshot data/redis_snapshot.json &
+# 演示每次从空存储开始，确保导入的是本次 build 生成的快照。
+rm -rf data/store
+./bin/featureline -addr 127.0.0.1:9500 -store-dir data/store -snapshot data/redis_snapshot.json &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 for i in $(seq 1 25); do

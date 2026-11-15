@@ -11,7 +11,7 @@ import (
 )
 
 func newSvc() (*Service, *store.MemoryStore) {
-	st := store.NewMemory("")
+	st := store.NewMemory()
 	reg := feature.DefaultRegistry()
 	return New(st, reg), st
 }

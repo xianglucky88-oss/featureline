@@ -49,7 +49,19 @@ jobs:
       - name: start service
         run: |
           go build -o /tmp/featureline ./cmd/serve
-          /tmp/featureline -addr 127.0.0.1:9500 -snapshot data/redis_snapshot.json &
+          rm -rf data/store
+          /tmp/featureline -addr 127.0.0.1:9500 -store-dir data/store -snapshot data/redis_snapshot.json &
           for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:9500/healthz && break; sleep 1; done
+      - name: durable store survives restart
+        run: |
+          set -u
+          curl -fsS -X POST http://127.0.0.1:9500/v1/admin/put \
+            -d '{"user_id":"U-crash","name":"user_7d_order_cnt","score":7,"source":"offline"}' -o /dev/null
+          pkill -9 -f '/tmp/featureline -addr 127.0.0.1:9500' || true
+          sleep 1
+          /tmp/featureline -addr 127.0.0.1:9500 -store-dir data/store -snapshot data/redis_snapshot.json &
+          for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:9500/healthz && break; sleep 1; done
+          got=$(curl -fsS http://127.0.0.1:9500/v1/features/U-crash | python -c 'import json,sys; print(json.load(sys.stdin)["features"]["user_7d_order_cnt"])')
+          test "$got" = "7"
       - name: verify (expected to fail until drift is fixed)
         run: python scripts/verify_features.py --base http://127.0.0.1:9500 || true
