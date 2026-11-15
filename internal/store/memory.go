@@ -74,14 +74,21 @@ func (s *MemoryStore) persist() {
 	_ = os.WriteFile(s.snapshotPath, raw, 0o644)
 }
 
-func (s *MemoryStore) Get(_ context.Context, userID, name string) (Value, bool, error) {
+func (s *MemoryStore) Get(ctx context.Context, userID, name string) (Value, bool, error) {
+	// 先响应取消/超时，避免在依赖已经放弃后还继续占用资源。
+	if err := ctx.Err(); err != nil {
+		return Value{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.data[key(userID, name)]
 	return v, ok, nil
 }
 
-func (s *MemoryStore) Set(_ context.Context, userID, name string, v Value) error {
+func (s *MemoryStore) Set(ctx context.Context, userID, name string, v Value) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key(userID, name)] = v
@@ -89,7 +96,10 @@ func (s *MemoryStore) Set(_ context.Context, userID, name string, v Value) error
 	return nil
 }
 
-func (s *MemoryStore) MGet(_ context.Context, userID string, names []string) (map[string]Value, error) {
+func (s *MemoryStore) MGet(ctx context.Context, userID string, names []string) (map[string]Value, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]Value, len(names))
@@ -101,7 +111,10 @@ func (s *MemoryStore) MGet(_ context.Context, userID string, names []string) (ma
 	return out, nil
 }
 
-func (s *MemoryStore) Keys(_ context.Context) ([]string, error) {
+func (s *MemoryStore) Keys(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]string, 0, len(s.data))
